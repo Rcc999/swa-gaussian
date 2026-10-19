@@ -1,0 +1,17 @@
+# Datasets (large; test_xs.npz exceeds GitHub's 100MB limit)
+*.npz
+test_ys.bytes
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Outputs
+results_check.byte
+*.log
+
+# OS
+.DS_Store
