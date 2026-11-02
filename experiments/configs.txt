@@ -1,0 +1,6 @@
+full_base SWAG_FULL 0.045 0 1
+diag_base SWAG_DIAGONAL 0.045 0 1
+full_burn5 SWAG_FULL 0.045 5 1
+full_burn5_k4 SWAG_FULL 0.045 5 4
+full_lr02_burn5_k4 SWAG_FULL 0.02 5 4
+full_lr01_burn5_k4 SWAG_FULL 0.01 5 4

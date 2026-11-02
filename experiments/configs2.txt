@@ -1,0 +1,4 @@
+lr02_noaug SWAG_FULL 0.02 5 4 0 0.0
+lr02_aug SWAG_FULL 0.02 5 4 1 0.0
+lr02_cutmix SWAG_FULL 0.02 5 4 0 0.5
+lr02_aug_cutmix SWAG_FULL 0.02 5 4 1 0.5

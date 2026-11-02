@@ -1,0 +1,36 @@
+recalibrate.py:59: RuntimeWarning: overflow encountered in exp
+  p = 1 / (1 + np.exp(-X @ w))
+recalibrate.py:63: RuntimeWarning: overflow encountered in exp
+  return lambda c: 1 / (1 + np.exp(-(w[0] * np.log(np.clip(c, EPS, 1 - EPS) / np.clip(1 - c, EPS, 1)) + w[1])))
+config                    method                               cost    ECE         total  stress
+full_lr02_burn5_k4        temperature (NLL+uniform, T>=1)     0.540  0.115   0.556 ±0.011   0.834
+full_lr02_burn5_k4        hist 5 equal-width                  0.508  0.079   0.515 ±0.018   0.883
+full_lr02_burn5_k4        hist 10 equal-width                 0.516  0.086   0.521 ±0.029   0.912
+full_lr02_burn5_k4        hist 5 equal-mass                   0.490  0.102   0.506 ±0.015   0.885
+full_lr02_burn5_k4        isotonic                            0.482  0.108   0.496 ±0.014   0.878
+full_lr02_burn5_k4        Platt (a, b)                        0.524  0.133   0.558 ±0.026   0.956
+
+lr02_cutmix               temperature (NLL+uniform, T>=1)     0.485  0.090   0.487 ±0.006   0.825
+lr02_cutmix               hist 5 equal-width                  0.454  0.073   0.457 ±0.031   0.827
+lr02_cutmix               hist 10 equal-width                 0.477  0.084   0.484 ±0.031   0.859
+lr02_cutmix               hist 5 equal-mass                   0.471  0.082   0.474 ±0.004   0.823
+lr02_cutmix               isotonic                            0.469  0.099   0.475 ±0.010   0.845
+lr02_cutmix               Platt (a, b)                        0.485  0.097   0.490 ±0.002   0.834
+
+lr02_cutmix+tta_cycle     temperature (NLL+uniform, T>=1)     0.442  0.092   0.445 ±0.014   0.764
+lr02_cutmix+tta_cycle     hist 5 equal-width                  0.495  0.069   0.496 ±0.014   0.804
+lr02_cutmix+tta_cycle     hist 10 equal-width                 0.484  0.076   0.488 ±0.025   0.799
+lr02_cutmix+tta_cycle     hist 5 equal-mass                   0.469  0.078   0.470 ±0.021   0.750
+lr02_cutmix+tta_cycle     isotonic                            0.463  0.090   0.465 ±0.008   0.792
+lr02_cutmix+tta_cycle     Platt (a, b)                        0.445  0.085   0.448 ±0.017   0.764
+
+
+lr02_noaug                temperature (NLL+uniform, T>=1)     0.535  0.114   0.549 ±0.007   0.830
+lr02_noaug                hist 5 equal-width                  0.520  0.083   0.527 ±0.017   0.913
+lr02_noaug                hist 10 equal-width                 0.533  0.089   0.540 ±0.010   0.938
+lr02_noaug                hist 5 equal-mass                   0.489  0.090   0.495 ±0.015   0.876
+lr02_noaug                isotonic                            0.485  0.112   0.499 ±0.009   0.874
+lr02_noaug                Platt (a, b)                        0.531  0.138   0.570 ±0.033   0.976
+
+
+

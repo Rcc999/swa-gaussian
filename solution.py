@@ -1,5 +1,6 @@
 import abc
 import collections
+import copy
 import enum
 import math
 import pathlib
@@ -111,16 +112,19 @@ class SWAGPredictor(object):
         self,
         train_images: torch.Tensor,
         weights_dir: pathlib.Path,
-        # TODO(1): change inference_mode to InferenceMode.SWAG_DIAGONAL
-        # TODO(2): change inference_mode to InferenceMode.SWAG_FULL
-        inference_mode: InferenceMode = InferenceMode.MAP,
+        inference_mode: InferenceMode = InferenceMode.SWAG_FULL,
         # TODO(2): optionally add/tweak hyperparameters
         swag_training_epochs: int = 30,
         swag_batch_size: int = 16,
-        swag_lr: float = 0.045,
+        swag_lr: float = 0.02,
         swag_update_interval: int = 1,
         max_rank_deviation_matrix: int = 15,
         num_bma_samples: int = 30,
+        swag_burn_in_epochs: int = 5,
+        swag_updates_per_epoch: int = 4,
+        swag_augment: bool = False,
+        swag_cutmix_prob: float = 0.0,
+        test_time_augmentation: str = "none",
     ):
         """
         :param train_images: Training images (for storage only)
@@ -132,7 +136,14 @@ class SWAGPredictor(object):
         :param swag_update_interval: Frequency (in epochs) for updating SWAG statistics during gradient descent
         :param max_rank_deviation_matrix: Rank of deviation matrix for full SWAG
         :param num_bma_samples: Number of networks to sample for Bayesian model averaging during prediction
+        :param swag_burn_in_epochs: Number of initial SWAG epochs during which no statistics are collected
+        :param swag_updates_per_epoch: Number of (evenly spaced) SWAG snapshots per collecting epoch
+        :param swag_augment: Apply a random rotation/flip (dihedral group D4) to every SWAG training image
+        :param swag_cutmix_prob: Probability of applying CutMix to a SWAG training batch
+        :param test_time_augmentation: "none" (original images only), "cycle" (posterior sample s predicts
+            on dihedral view s mod 8, same cost as "none"), or "full" (every sample predicts on all 8 views)
         """
+        assert test_time_augmentation in ("none", "cycle", "full")
 
         self.weights_dir = weights_dir
         self.inference_mode = inference_mode
@@ -142,6 +153,11 @@ class SWAGPredictor(object):
         self.swag_update_interval = swag_update_interval
         self.max_rank_deviation_matrix = max_rank_deviation_matrix
         self.num_bma_samples = num_bma_samples
+        self.swag_burn_in_epochs = swag_burn_in_epochs
+        self.swag_updates_per_epoch = swag_updates_per_epoch
+        self.swag_augment = swag_augment
+        self.swag_cutmix_prob = swag_cutmix_prob
+        self.test_time_augmentation = test_time_augmentation
 
         # Network used to perform SWAG.
         # Note that all operations in this class modify this network IN-PLACE!
@@ -150,20 +166,20 @@ class SWAGPredictor(object):
         # Store training dataset to recalculate batch normalization statistics during SWAG inference
         self.training_dataset = torch.utils.data.TensorDataset(train_images)
 
-        # SWAG-diagonal
-        # TODO(1): create attributes for SWAG-diagonal
-        #  Hint: self._create_weight_copy() creates an all-zero copy of the weights
-        #  as a dictionary that maps from weight name to values.
-        #  Hint: you never need to consider the full vector of weights,
-        #  but can always act on per-layer weights (in the format that _create_weight_copy() returns)
+        # SWAG-diagonal: running first and second moments of the weights, and the number of snapshots
+        self._swag_num_snapshots = 0
+        self._swag_mean = self._create_weight_copy()
+        self._swag_sq_mean = self._create_weight_copy()
 
-        # Full SWAG
-        # TODO(2): create attributes for SWAG-full
-        #  Hint: check collections.deque
+        # Full SWAG: the last K deviations (theta_i - running mean), one per-layer dict per snapshot
+        self._swag_deviations = collections.deque(maxlen=self.max_rank_deviation_matrix)
 
         # Calibration, prediction, and other attributes
-        # TODO(2): create additional attributes, e.g., for calibration
-        self._calibration_threshold = None  # this is an example, feel free to be creative
+        self._calibration_threshold = None
+        # Temperature applied to every sampled network's logits before the softmax (fit on validation data)
+        self._temperature = 1.0
+        # Posterior samples (state dicts incl. batchnorm statistics), drawn once and reused for all predictions
+        self._posterior_samples = None
 
     def update_swag_statistics(self) -> None:
         """
@@ -174,14 +190,18 @@ class SWAGPredictor(object):
         copied_params = {name: param.detach() for name, param in self.network.named_parameters()}
 
         # SWAG-diagonal
+        n = self._swag_num_snapshots
         for name, param in copied_params.items():
-            # TODO(1): update SWAG-diagonal attributes for weight `name` using `copied_params` and `param`
-            raise NotImplementedError("Update SWAG-diagonal statistics")
+            self._swag_mean[name] = (n * self._swag_mean[name] + param) / (n + 1)
+            self._swag_sq_mean[name] = (n * self._swag_sq_mean[name] + param ** 2) / (n + 1)
+        self._swag_num_snapshots += 1
 
         # Full SWAG
         if self.inference_mode == InferenceMode.SWAG_FULL:
-            # TODO(2): update full SWAG attributes for weight `name` using `copied_params` and `param`
-            raise NotImplementedError("Update full SWAG statistics")
+            # Deviation from the running mean that already includes the current snapshot (as in Maddox et al.)
+            self._swag_deviations.append(
+                {name: param - self._swag_mean[name] for name, param in copied_params.items()}
+            )
 
     def fit_swag_model(self, loader: torch.utils.data.DataLoader) -> None:
         """
@@ -211,8 +231,13 @@ class SWAGPredictor(object):
             steps_per_epoch=len(loader),
         )
 
-        # TODO(1): Perform initialization for SWAG fitting
-        raise NotImplementedError("Initialize SWAG fitting")
+        # Reset all SWAG statistics; the pretrained MAP weights themselves are not a snapshot
+        self._swag_num_snapshots = 0
+        self._swag_mean = self._create_weight_copy()
+        self._swag_sq_mean = self._create_weight_copy()
+        self._swag_deviations.clear()
+        self._posterior_samples = None
+        batches_between_updates = max(len(loader) // self.swag_updates_per_epoch, 1)
 
         self.network.train()
         with tqdm.trange(self.swag_training_epochs, desc="Running gradient descent for SWA") as pbar:
@@ -221,10 +246,16 @@ class SWAGPredictor(object):
                 avg_loss = 0.0
                 avg_accuracy = 0.0
                 num_samples = 0
-                for batch_images, batch_snow_labels, batch_cloud_labels, batch_labels in loader:
+                for batch_index, (batch_images, batch_snow_labels, batch_cloud_labels, batch_labels) in enumerate(loader):
+                    batch_targets = torch.nn.functional.one_hot(batch_labels, num_classes=6).float()
+                    if self.swag_augment:
+                        batch_images = random_dihedral_transform(batch_images)
+                    if self.swag_cutmix_prob > 0 and torch.rand(()).item() < self.swag_cutmix_prob:
+                        batch_images, batch_targets = cutmix(batch_images, batch_targets)
+
                     optimizer.zero_grad()
                     predictions = self.network(batch_images)
-                    batch_loss = loss_fn(input=predictions, target=batch_labels)
+                    batch_loss = loss_fn(input=predictions, target=batch_targets)
                     batch_loss.backward()
                     optimizer.step()
                     progress_dict["lr"] = lr_scheduler.get_last_lr()[0]
@@ -243,8 +274,16 @@ class SWAGPredictor(object):
                     progress_dict["avg. epoch accuracy"] = avg_accuracy
                     pbar.set_postfix(progress_dict)
 
-                # TODO(1): Implement periodic SWAG updates using the attributes defined in __init__
-                raise NotImplementedError("Periodically update SWAG statistics")
+                    # After burn-in, collect `swag_updates_per_epoch` evenly spaced snapshots
+                    # in every `swag_update_interval`-th epoch (the last one at the end of the epoch)
+                    num_batches_done = batch_index + 1
+                    if (
+                        epoch >= self.swag_burn_in_epochs
+                        and (epoch + 1) % self.swag_update_interval == 0
+                        and num_batches_done % batches_between_updates == 0
+                        and num_batches_done // batches_between_updates <= self.swag_updates_per_epoch
+                    ):
+                        self.update_swag_statistics()
 
     def calibrate_confidence(self, validation_data: torch.utils.data.Dataset) -> None:
         """
@@ -257,16 +296,45 @@ class SWAGPredictor(object):
             self._calibration_threshold = 0.0
             return
 
-        # TODO(1): pick a prediction threshold, either constant or adaptive.
+        # Predicting a label with confidence p costs 3 * (1 - p) in expectation, "don't know" always costs 1.
+        # Hence, for calibrated probabilities, predicting is optimal iff p >= 2/3.
         self._calibration_threshold = 2.0 / 3.0
 
-        # TODO(2): perform additional calibration if desired.
-        #  Feel free to remove or change the prediction threshold.
         val_images, val_snow_labels, val_cloud_labels, val_labels = validation_data.tensors
         assert val_images.size() == (140, 3, 60, 60)  # N x C x H x W
         assert val_labels.size() == (140,)
         assert val_snow_labels.size() == (140,)
         assert val_cloud_labels.size() == (140,)
+
+        # Temperature scaling: a single scalar T divides every sampled network's logits before the softmax.
+        # Ambiguous samples (label -1) have no target class, so plain NLL cannot use them.
+        # Instead, we minimize NLL on well-defined samples plus the cross-entropy between the uniform distribution
+        # and the prediction on ambiguous samples, which explicitly penalizes confidence on ambiguous images.
+        # We only allow T >= 1 (never sharpen): the test set contains more ambiguity than the validation set,
+        # and an ECE-based fit that sharpened the predictions (T = 0.5) failed the public test set.
+        self.network.eval()
+        loader = torch.utils.data.DataLoader(
+            torch.utils.data.TensorDataset(val_images),
+            batch_size=32,
+            shuffle=False,
+            num_workers=0,
+            drop_last=False,
+        )
+        with torch.no_grad():
+            val_logits = torch.stack(self._predict_logits_per_sample(loader))  # S x V x N x C
+
+        ambiguous_mask = val_labels == -1
+        best_loss = None
+        for temperature in np.round(np.arange(1.0, 5.01, 0.05), 2):
+            probabilities = torch.softmax(val_logits / float(temperature), dim=-1).mean(dim=(0, 1))
+            log_probabilities = torch.log(torch.clamp(probabilities, min=1e-12))
+            nll = -log_probabilities[~ambiguous_mask, val_labels[~ambiguous_mask]].sum()
+            uniform_cross_entropy = -log_probabilities[ambiguous_mask].mean(dim=-1).sum()
+            loss = (nll + uniform_cross_entropy).item() / val_labels.size(0)
+            if best_loss is None or loss < best_loss:
+                best_loss = loss
+                self._temperature = float(temperature)
+        print(f"Calibrated temperature {self._temperature:.2f} with validation loss {best_loss:.4f}")
 
     def predict_probabilities_swag(self, loader: torch.utils.data.DataLoader) -> torch.Tensor:
         """
@@ -283,14 +351,11 @@ class SWAGPredictor(object):
         # Instead of sampling self.num_bma_samples networks (using self.sample_parameters())
         # for each datapoint, you can save time by sampling self.num_bma_samples networks,
         # and perform inference with each network on all samples in loader.
-        model_predictions = []
-        for _ in tqdm.trange(self.num_bma_samples, desc="Performing Bayesian model averaging"):
-            # TODO(1): Sample new parameters for self.network from the SWAG approximate posterior
-            raise NotImplementedError("Sample network parameters")
-
-            # TODO(1): Perform inference for all samples in `loader` using current model sample,
-            #  and add the predictions to model_predictions
-            raise NotImplementedError("Perform inference using current model")
+        # Each posterior sample's prediction averages over its test-time augmentation views
+        model_predictions = [
+            torch.softmax(sample_logits / self._temperature, dim=-1).mean(dim=0)
+            for sample_logits in self._predict_logits_per_sample(loader)
+        ]
 
         assert len(model_predictions) == self.num_bma_samples
         assert all(
@@ -300,12 +365,46 @@ class SWAGPredictor(object):
             for sample_predictions in model_predictions
         )
 
-        # TODO(1): Average predictions from different model samples into bma_probabilities
-        raise NotImplementedError("Aggregate predictions from model samples")
-        bma_probabilities = ...
+        # BMA: average the predictive distributions (not the logits) of all posterior samples
+        bma_probabilities = torch.stack(model_predictions).mean(dim=0)
 
         assert bma_probabilities.dim() == 2 and bma_probabilities.size(1) == 6  # N x C
         return bma_probabilities
+
+    def _draw_posterior_samples(self) -> None:
+        """
+        Draw self.num_bma_samples networks from the SWAG posterior once, and store their state dicts
+        (including the refitted batchnorm statistics). Validation calibration and test prediction then
+        use the exact same posterior samples, and batchnorm statistics are only recomputed once per sample.
+        """
+        self._posterior_samples = []
+        for _ in tqdm.trange(self.num_bma_samples, desc="Sampling networks from the SWAG posterior"):
+            self.sample_parameters()
+            self._posterior_samples.append(copy.deepcopy(self.network.state_dict()))
+
+    def _predict_logits_per_sample(self, loader: torch.utils.data.DataLoader) -> typing.List[torch.Tensor]:
+        """
+        Return the (untempered) V x N x C logits of every cached posterior sample for all samples in loader,
+        where V is the number of test-time augmentation views that sample uses.
+        """
+        if self._posterior_samples is None:
+            self._draw_posterior_samples()
+
+        all_logits = []
+        for sample_index, state_dict in enumerate(self._posterior_samples):
+            if self.test_time_augmentation == "full":
+                views = range(NUM_DIHEDRAL_TRANSFORMS)
+            elif self.test_time_augmentation == "cycle":
+                views = [sample_index % NUM_DIHEDRAL_TRANSFORMS]
+            else:
+                views = [0]
+            self.network.load_state_dict(state_dict)
+            self.network.eval()
+            all_logits.append(torch.stack([
+                torch.cat([self.network(dihedral_transform(batch_images, view)) for (batch_images,) in loader])
+                for view in views
+            ]))
+        return all_logits
 
     def sample_parameters(self) -> None:
         """
@@ -314,31 +413,40 @@ class SWAGPredictor(object):
         Hence, after calling this method, self.network corresponds to a new posterior sample.
         """
 
+        use_low_rank = self.inference_mode == InferenceMode.SWAG_FULL and len(self._swag_deviations) > 1
+        if use_low_rank:
+            # The low-rank term acts on the full weight vector,
+            # so a single z_low_rank in R^K must be shared by all layers.
+            rank = len(self._swag_deviations)
+            z_low_rank = torch.randn(rank)
+
         # Instead of acting on a full vector of parameters, all operations can be done on per-layer parameters.
         for name, param in self.network.named_parameters():
             # SWAG-diagonal part
             z_diag = torch.randn(param.size())
-            # TODO(1): Sample parameter values for SWAG-diagonal
-            raise NotImplementedError("Sample parameter for SWAG-diagonal")
-            mean_weights = ...
-            std_weights = ...
+            mean_weights = self._swag_mean[name]
+            # Clamp: E[theta^2] - E[theta]^2 can be slightly negative due to floating point errors
+            variance = torch.clamp(self._swag_sq_mean[name] - mean_weights ** 2, min=1e-30)
+            std_weights = torch.sqrt(variance)
+            if use_low_rank:
+                # Full SWAG covariance is (Sigma_diag + D D^T / (K - 1)) / 2
+                std_weights = std_weights / math.sqrt(2.0)
             assert mean_weights.size() == param.size() and std_weights.size() == param.size()
 
             # Diagonal part
             sampled_weight = mean_weights + std_weights * z_diag
 
             # Full SWAG part
-            if self.inference_mode == InferenceMode.SWAG_FULL:
-                # TODO(2): Sample parameter values for full SWAG
-                raise NotImplementedError("Sample parameter for full SWAG")
-                sampled_weight += ...
+            if use_low_rank:
+                # Per-layer slice of the deviation matrix D, shape (*param.size(), K)
+                deviation_matrix = torch.stack([deviation[name] for deviation in self._swag_deviations], dim=-1)
+                sampled_weight += (deviation_matrix @ z_low_rank) / math.sqrt(2.0 * (rank - 1))
 
             # Modify weight value in-place; directly changing self.network
             param.data = sampled_weight
 
-        # TODO(1): Don't forget to update batch normalization statistics using self._update_batchnorm_statistics()
-        #  in the appropriate place!
-        raise NotImplementedError("Update batch normalization statistics for newly sampled network")
+        # Batchnorm statistics of the sampled network differ from those stored during training
+        self._update_batchnorm_statistics()
 
     def decide_labels(self, predicted_probabilities: torch.Tensor) -> torch.Tensor:
         """
@@ -556,6 +664,55 @@ class SWAGPredictor(object):
         # Restore old `momentum` hyperparameter values
         for module, momentum in original_momentum_values.items():
             module.momentum = momentum
+
+
+NUM_DIHEDRAL_TRANSFORMS = 8
+
+
+def dihedral_transform(images: torch.Tensor, index: int) -> torch.Tensor:
+    """
+    Apply element `index` in {0, ..., 7} of the dihedral group D4 to a batch of N x C x H x W images:
+    a rotation by (index mod 4) * 90 degrees, followed by a horizontal flip if index >= 4. Index 0 is the identity.
+    Satellite images have no canonical orientation, so all 8 views show the same scene.
+    """
+    images = torch.rot90(images, index % 4, dims=(2, 3))
+    if index >= 4:
+        images = torch.flip(images, dims=(3,))
+    return images
+
+
+def random_dihedral_transform(images: torch.Tensor) -> torch.Tensor:
+    """Apply an independent, uniformly random dihedral transform to every image in the batch."""
+    transform_indices = torch.randint(NUM_DIHEDRAL_TRANSFORMS, (images.size(0),))
+    transformed = images.clone()
+    for index in range(NUM_DIHEDRAL_TRANSFORMS):
+        mask = transform_indices == index
+        if mask.any():
+            transformed[mask] = dihedral_transform(images[mask], index)
+    return transformed
+
+
+def cutmix(images: torch.Tensor, targets: torch.Tensor) -> typing.Tuple[torch.Tensor, torch.Tensor]:
+    """
+    CutMix (Yun et al., 2019): paste a random box from a shuffled copy of the batch into every image,
+    and mix the (soft) targets proportionally to the pasted area.
+    Mixed images resemble the ambiguous test images that show multiple land usage types.
+    """
+    _, _, height, width = images.size()
+    permutation = torch.randperm(images.size(0))
+    mixing_ratio = torch.distributions.Beta(1.0, 1.0).sample().item()
+    box_height = int(height * math.sqrt(1.0 - mixing_ratio))
+    box_width = int(width * math.sqrt(1.0 - mixing_ratio))
+    center_y = torch.randint(height, ()).item()
+    center_x = torch.randint(width, ()).item()
+    top, bottom = max(center_y - box_height // 2, 0), min(center_y + box_height // 2, height)
+    left, right = max(center_x - box_width // 2, 0), min(center_x + box_width // 2, width)
+
+    mixed_images = images.clone()
+    mixed_images[:, :, top:bottom, left:right] = images[permutation, :, top:bottom, left:right]
+    pasted_fraction = (bottom - top) * (right - left) / (height * width)
+    mixed_targets = (1.0 - pasted_fraction) * targets + pasted_fraction * targets[permutation]
+    return mixed_images, mixed_targets
 
 
 class SWAGScheduler(torch.optim.lr_scheduler.LRScheduler):

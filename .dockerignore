@@ -1,0 +1,7 @@
+.venv
+.git
+__pycache__
+*.pdf
+results_check.byte
+experiments
+submissions

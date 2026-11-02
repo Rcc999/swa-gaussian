@@ -15,3 +15,7 @@ results_check.byte
 
 # OS
 .DS_Store
+*.pdf
+experiments/runs/
+experiments/logs/
+submissions/
