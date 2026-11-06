@@ -124,7 +124,12 @@ class SWAGPredictor(object):
         swag_updates_per_epoch: int = 4,
         swag_augment: bool = False,
         swag_cutmix_prob: float = 0.0,
-        test_time_augmentation: str = "none",
+        test_time_augmentation: str = "cycle",
+        swag_lr_schedule: str = "constant",
+        swag_lr_min: float = 0.002,
+        swag_variance_scale: float = 1.0,
+        swag_outlier_exposure_weight: float = 0.5,
+        calibration_min_temperature: float = 0.8,
     ):
         """
         :param train_images: Training images (for storage only)
@@ -142,6 +147,13 @@ class SWAGPredictor(object):
         :param swag_cutmix_prob: Probability of applying CutMix to a SWAG training batch
         :param test_time_augmentation: "none" (original images only), "cycle" (posterior sample s predicts
             on dihedral view s mod 8, same cost as "none"), or "full" (every sample predicts on all 8 views)
+        :param swag_lr_schedule: "constant" (swag_lr throughout) or "cyclic" (cosine from swag_lr down to
+            swag_lr_min between consecutive SWAG snapshots, which are taken at the low point)
+        :param swag_lr_min: Lowest learning rate of the cyclical schedule
+        :param swag_variance_scale: Factor on the SWAG covariance when sampling (1 = the fitted posterior)
+        :param swag_outlier_exposure_weight: Weight of an extra SWAG training loss that pushes predictions on
+            synthetic mixed-class scenes towards the uniform distribution (0 disables it)
+        :param calibration_min_temperature: Smallest temperature the validation fit may choose
         """
         assert test_time_augmentation in ("none", "cycle", "full")
 
@@ -158,6 +170,11 @@ class SWAGPredictor(object):
         self.swag_augment = swag_augment
         self.swag_cutmix_prob = swag_cutmix_prob
         self.test_time_augmentation = test_time_augmentation
+        self.swag_lr_schedule = swag_lr_schedule
+        self.swag_lr_min = swag_lr_min
+        self.swag_variance_scale = swag_variance_scale
+        self.swag_outlier_exposure_weight = swag_outlier_exposure_weight
+        self.calibration_min_temperature = calibration_min_temperature
 
         # Network used to perform SWAG.
         # Note that all operations in this class modify this network IN-PLACE!
@@ -166,19 +183,17 @@ class SWAGPredictor(object):
         # Store training dataset to recalculate batch normalization statistics during SWAG inference
         self.training_dataset = torch.utils.data.TensorDataset(train_images)
 
-        # SWAG-diagonal: running first and second moments of the weights, and the number of snapshots
+        # SWAG-diagonal
         self._swag_num_snapshots = 0
         self._swag_mean = self._create_weight_copy()
         self._swag_sq_mean = self._create_weight_copy()
 
-        # Full SWAG: the last K deviations (theta_i - running mean), one per-layer dict per snapshot
+        # Full SWAG
         self._swag_deviations = collections.deque(maxlen=self.max_rank_deviation_matrix)
 
         # Calibration, prediction, and other attributes
         self._calibration_threshold = None
-        # Temperature applied to every sampled network's logits before the softmax (fit on validation data)
         self._temperature = 1.0
-        # Posterior samples (state dicts incl. batchnorm statistics), drawn once and reused for all predictions
         self._posterior_samples = None
 
     def update_swag_statistics(self) -> None:
@@ -198,7 +213,6 @@ class SWAGPredictor(object):
 
         # Full SWAG
         if self.inference_mode == InferenceMode.SWAG_FULL:
-            # Deviation from the running mean that already includes the current snapshot (as in Maddox et al.)
             self._swag_deviations.append(
                 {name: param - self._swag_mean[name] for name, param in copied_params.items()}
             )
@@ -223,21 +237,22 @@ class SWAGPredictor(object):
         loss_fn = torch.nn.CrossEntropyLoss(
             reduction="mean",
         )
-        # TODO(2): Update SWAGScheduler instantiation if you decided to implement a custom schedule.
-        #  By default, this scheduler just keeps the initial learning rate given to `optimizer`.
+        batches_between_updates = max(len(loader) // self.swag_updates_per_epoch, 1)
         lr_scheduler = SWAGScheduler(
             optimizer,
             epochs=self.swag_training_epochs,
             steps_per_epoch=len(loader),
+            schedule=self.swag_lr_schedule,
+            lr_max=self.swag_lr,
+            lr_min=self.swag_lr_min,
+            cycle_steps=batches_between_updates,
         )
 
-        # Reset all SWAG statistics; the pretrained MAP weights themselves are not a snapshot
         self._swag_num_snapshots = 0
         self._swag_mean = self._create_weight_copy()
         self._swag_sq_mean = self._create_weight_copy()
         self._swag_deviations.clear()
         self._posterior_samples = None
-        batches_between_updates = max(len(loader) // self.swag_updates_per_epoch, 1)
 
         self.network.train()
         with tqdm.trange(self.swag_training_epochs, desc="Running gradient descent for SWA") as pbar:
@@ -254,8 +269,19 @@ class SWAGPredictor(object):
                         batch_images, batch_targets = cutmix(batch_images, batch_targets)
 
                     optimizer.zero_grad()
-                    predictions = self.network(batch_images)
-                    batch_loss = loss_fn(input=predictions, target=batch_targets)
+                    if self.swag_outlier_exposure_weight > 0:
+                        # Outlier exposure: push predictions on synthetic mixed scenes towards uniform
+                        mixed_images = make_mixed_scenes(batch_images, batch_labels)
+                        all_predictions = self.network(torch.cat([batch_images, mixed_images]))
+                        predictions = all_predictions[: batch_images.size(0)]
+                        mixed_predictions = all_predictions[batch_images.size(0):]
+                        uniform_cross_entropy = -torch.log_softmax(mixed_predictions, dim=-1).mean(dim=-1)
+                        batch_loss = loss_fn(input=predictions, target=batch_targets)
+                        if mixed_images.size(0) > 0:
+                            batch_loss = batch_loss + self.swag_outlier_exposure_weight * uniform_cross_entropy.mean()
+                    else:
+                        predictions = self.network(batch_images)
+                        batch_loss = loss_fn(input=predictions, target=batch_targets)
                     batch_loss.backward()
                     optimizer.step()
                     progress_dict["lr"] = lr_scheduler.get_last_lr()[0]
@@ -274,8 +300,6 @@ class SWAGPredictor(object):
                     progress_dict["avg. epoch accuracy"] = avg_accuracy
                     pbar.set_postfix(progress_dict)
 
-                    # After burn-in, collect `swag_updates_per_epoch` evenly spaced snapshots
-                    # in every `swag_update_interval`-th epoch (the last one at the end of the epoch)
                     num_batches_done = batch_index + 1
                     if (
                         epoch >= self.swag_burn_in_epochs
@@ -306,12 +330,8 @@ class SWAGPredictor(object):
         assert val_snow_labels.size() == (140,)
         assert val_cloud_labels.size() == (140,)
 
-        # Temperature scaling: a single scalar T divides every sampled network's logits before the softmax.
-        # Ambiguous samples (label -1) have no target class, so plain NLL cannot use them.
-        # Instead, we minimize NLL on well-defined samples plus the cross-entropy between the uniform distribution
-        # and the prediction on ambiguous samples, which explicitly penalizes confidence on ambiguous images.
-        # We only allow T >= 1 (never sharpen): the test set contains more ambiguity than the validation set,
-        # and an ECE-based fit that sharpened the predictions (T = 0.5) failed the public test set.
+        # Temperature scaling: minimize NLL on well-defined samples
+        # plus the cross-entropy to the uniform distribution on ambiguous samples
         self.network.eval()
         loader = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(val_images),
@@ -325,7 +345,7 @@ class SWAGPredictor(object):
 
         ambiguous_mask = val_labels == -1
         best_loss = None
-        for temperature in np.round(np.arange(1.0, 5.01, 0.05), 2):
+        for temperature in np.round(np.arange(self.calibration_min_temperature, 5.01, 0.05), 2):
             probabilities = torch.softmax(val_logits / float(temperature), dim=-1).mean(dim=(0, 1))
             log_probabilities = torch.log(torch.clamp(probabilities, min=1e-12))
             nll = -log_probabilities[~ambiguous_mask, val_labels[~ambiguous_mask]].sum()
@@ -351,7 +371,6 @@ class SWAGPredictor(object):
         # Instead of sampling self.num_bma_samples networks (using self.sample_parameters())
         # for each datapoint, you can save time by sampling self.num_bma_samples networks,
         # and perform inference with each network on all samples in loader.
-        # Each posterior sample's prediction averages over its test-time augmentation views
         model_predictions = [
             torch.softmax(sample_logits / self._temperature, dim=-1).mean(dim=0)
             for sample_logits in self._predict_logits_per_sample(loader)
@@ -365,7 +384,6 @@ class SWAGPredictor(object):
             for sample_predictions in model_predictions
         )
 
-        # BMA: average the predictive distributions (not the logits) of all posterior samples
         bma_probabilities = torch.stack(model_predictions).mean(dim=0)
 
         assert bma_probabilities.dim() == 2 and bma_probabilities.size(1) == 6  # N x C
@@ -415,8 +433,7 @@ class SWAGPredictor(object):
 
         use_low_rank = self.inference_mode == InferenceMode.SWAG_FULL and len(self._swag_deviations) > 1
         if use_low_rank:
-            # The low-rank term acts on the full weight vector,
-            # so a single z_low_rank in R^K must be shared by all layers.
+            # The low-rank term acts on the full weight vector, so z_low_rank is shared by all layers
             rank = len(self._swag_deviations)
             z_low_rank = torch.randn(rank)
 
@@ -429,8 +446,9 @@ class SWAGPredictor(object):
             variance = torch.clamp(self._swag_sq_mean[name] - mean_weights ** 2, min=1e-30)
             std_weights = torch.sqrt(variance)
             if use_low_rank:
-                # Full SWAG covariance is (Sigma_diag + D D^T / (K - 1)) / 2
                 std_weights = std_weights / math.sqrt(2.0)
+            covariance_scale = math.sqrt(self.swag_variance_scale)
+            std_weights = std_weights * covariance_scale
             assert mean_weights.size() == param.size() and std_weights.size() == param.size()
 
             # Diagonal part
@@ -438,14 +456,12 @@ class SWAGPredictor(object):
 
             # Full SWAG part
             if use_low_rank:
-                # Per-layer slice of the deviation matrix D, shape (*param.size(), K)
                 deviation_matrix = torch.stack([deviation[name] for deviation in self._swag_deviations], dim=-1)
-                sampled_weight += (deviation_matrix @ z_low_rank) / math.sqrt(2.0 * (rank - 1))
+                sampled_weight += covariance_scale * (deviation_matrix @ z_low_rank) / math.sqrt(2.0 * (rank - 1))
 
             # Modify weight value in-place; directly changing self.network
             param.data = sampled_weight
 
-        # Batchnorm statistics of the sampled network differ from those stored during training
         self._update_batchnorm_statistics()
 
     def decide_labels(self, predicted_probabilities: torch.Tensor) -> torch.Tensor:
@@ -715,6 +731,27 @@ def cutmix(images: torch.Tensor, targets: torch.Tensor) -> typing.Tuple[torch.Te
     return mixed_images, mixed_targets
 
 
+def make_mixed_scenes(images: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """
+    Build synthetic ambiguous images: paste a random box covering 30-70% of the area from a shuffled copy
+    of the batch into every image. Only pairs with different labels are returned, so each output
+    genuinely shows two land usage types.
+    """
+    _, _, height, width = images.size()
+    permutation = torch.randperm(images.size(0))
+    different_class = labels[permutation] != labels
+    area_fraction = 0.3 + 0.4 * torch.rand(()).item()
+    box_height = int(round(height * math.sqrt(area_fraction)))
+    box_width = int(round(width * math.sqrt(area_fraction)))
+    top = torch.randint(height - box_height + 1, ()).item()
+    left = torch.randint(width - box_width + 1, ()).item()
+
+    mixed_images = images.clone()
+    mixed_images[:, :, top:top + box_height, left:left + box_width] = \
+        images[permutation, :, top:top + box_height, left:left + box_width]
+    return mixed_images[different_class]
+
+
 class SWAGScheduler(torch.optim.lr_scheduler.LRScheduler):
     """
     Custom learning rate scheduler that calculates a different learning rate each gradient descent step.
@@ -734,18 +771,31 @@ class SWAGScheduler(torch.optim.lr_scheduler.LRScheduler):
 
         This method should return a single float: the new learning rate.
         """
-        # TODO(2): Implement a custom schedule if desired
-        return previous_lr
+        if self.schedule == "constant":
+            return previous_lr
 
-    # TODO(2): Add and store additional arguments if you decide to implement a custom scheduler
+        # Half-cosine decay from lr_max to lr_min within each cycle; snapshots are taken at the low point
+        step_in_epoch = round(current_epoch * self.steps_per_epoch) % self.steps_per_epoch
+        phase = (step_in_epoch % self.cycle_steps) / self.cycle_steps
+        return self.lr_min + 0.5 * (self.lr_max - self.lr_min) * (1.0 + math.cos(math.pi * phase))
+
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
         epochs: int,
         steps_per_epoch: int,
+        schedule: str = "constant",
+        lr_max: float = 0.0,
+        lr_min: float = 0.0,
+        cycle_steps: int = 1,
     ):
+        assert schedule in ("constant", "cyclic")
         self.epochs = epochs
         self.steps_per_epoch = steps_per_epoch
+        self.schedule = schedule
+        self.lr_max = lr_max
+        self.lr_min = lr_min
+        self.cycle_steps = max(cycle_steps, 1)
         super().__init__(optimizer, last_epoch=-1, verbose=False)
 
     def get_lr(self):

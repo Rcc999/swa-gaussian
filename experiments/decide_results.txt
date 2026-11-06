@@ -1,0 +1,22 @@
+
+full_lr02_burn5_k4: thresholds fit with ambiguous weight 1  (prediction cost, mean over 3 seeds)
+  rule                                                     val  stress
+  max prob >= 2/3 (submitted)                            0.533   0.756
+  fitted threshold on 1 - max prob                       0.497   0.783
+  fitted threshold on entropy                            0.541   0.861
+  fitted threshold on mutual information                 0.555   0.842
+  fitted threshold on 1 - vote agreement                 0.486   0.791
+  max prob >= 2/3 AND fitted cap on mutual information   0.539   0.743
+  max prob >= 2/3 AND fitted cap on 1 - vote agreement   0.539   0.755
+  per-class max-prob thresholds                          0.518   0.826
+
+full_lr02_burn5_k4: thresholds fit with ambiguous weight 3  (prediction cost, mean over 3 seeds)
+  rule                                                     val  stress
+  max prob >= 2/3 (submitted)                            0.533   0.756
+  fitted threshold on 1 - max prob                       0.553   0.790
+  fitted threshold on entropy                            0.612   0.839
+  fitted threshold on mutual information                 0.584   0.803
+  fitted threshold on 1 - vote agreement                 0.490   0.776
+  max prob >= 2/3 AND fitted cap on mutual information   0.554   0.742
+  max prob >= 2/3 AND fitted cap on 1 - vote agreement   0.547   0.764
+  per-class max-prob thresholds                          0.574   0.825

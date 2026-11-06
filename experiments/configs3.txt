@@ -1,0 +1,5 @@
+p_const_bs16 0.02 constant 0.002 16
+p_const_bs32 0.02 constant 0.002 32
+p_const_bs8 0.02 constant 0.002 8
+p_cyc05 0.05 cyclic 0.005 16
+p_cyc03 0.03 cyclic 0.002 16
